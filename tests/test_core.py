@@ -1,5 +1,6 @@
 """核心规则测试：重放、窗口、修订、持久化与旧结果抑制。"""
 
+import json
 import math
 import os
 import tempfile
@@ -229,6 +230,159 @@ class TestPersistence(unittest.TestCase):
             self.assertEqual(replay["decision"], REPLAYED)
         finally:
             os.unlink(path)
+
+
+class TestRevisionSnapshots(unittest.TestCase):
+    """修订快照与差异凭证：仅接受产生快照；差异只落在滞后窗口允许的后缀。"""
+
+    def setUp(self):
+        self.store = Store(config=cfg(lag=2.0))
+
+    def submit(self, oid, t, x, y):
+        return self.store.submit_observation(
+            {"id": oid, "timestamp": t, "x": x, "y": y}
+        )
+
+    def test_snapshot_only_on_accept(self):
+        self.submit("A", 1.0, 1.0, 0.0)  # 接受 -> 修订 1
+        self.submit("A", 1.0, 1.0, 0.0)  # 同内容回放：不得伪造快照
+        self.submit("OLD", -5.0, 0.0, 0.0)  # 窗口外拒绝：不得伪造快照
+        self.submit("B", 2.0, 2.0, 0.0)  # 接受 -> 修订 2
+        cat = self.store.revision_catalog()
+        self.assertEqual([m["revision"] for m in cat], [1, 2])
+        st = self.store.state()
+        self.assertEqual([m["revision"] for m in st["revisions"]], [1, 2])
+        # 快照元数据：末观测时刻与轨迹点数
+        self.assertEqual(cat[0]["last_observation_time"], 1.0)
+        self.assertEqual(cat[1]["last_observation_time"], 2.0)
+        self.assertEqual(cat[1]["point_count"], 2)
+
+    def test_sealed_boundary_recorded(self):
+        self.submit("A", 1.0, 1.0, 0.0)
+        self.submit("B", 2.0, 2.0, 0.0)
+        self.submit("C", 3.0, 3.0, 0.0)
+        cat = self.store.revision_catalog()
+        # 修订 3：末观测 t=3，lag=2 -> 封存边界 1.0，检查点为首个观测
+        self.assertEqual(cat[2]["sealed_before"], 1.0)
+        self.assertEqual(cat[2]["anchor_seq"], 0)
+        # 修订 1/2：边界之前没有任何观测，无封存边界
+        self.assertIsNone(cat[0]["sealed_before"])
+        self.assertIsNone(cat[1]["sealed_before"])
+
+    def test_diff_sequential_accept_single_point_change(self):
+        self.submit("A", 1.0, 1.0, 0.0)
+        self.submit("B", 2.0, 2.0, 0.0)
+        d = self.store.diff_revision(2)
+        self.assertTrue(d["comparable"])
+        self.assertEqual((d["from_revision"], d["to_revision"]), (1, 2))
+        # 顺序追加：仅新增点变化，既有轨迹点逐位一致
+        self.assertEqual(d["changed_count"], 1)
+        self.assertEqual(d["changes"][0]["kind"], "added")
+        self.assertEqual(d["first_changed_timestamp"], 2.0)
+        self.assertEqual(d["last_changed_timestamp"], 2.0)
+        self.assertTrue(d["sealed_prefix"]["identical"])
+        self.assertTrue(d["suffix_only"])
+
+    def test_diff_late_observation_changes_suffix_only(self):
+        self.submit("A", 1.0, 1.0, 0.0)
+        self.submit("B", 2.0, 2.0, 0.0)
+        self.submit("C", 3.0, 3.0, 0.0)
+        self.submit("LATE", 1.5, 1.2, 0.5)  # 窗口内迟到 -> 修订 4
+        d = self.store.diff_revision(4)
+        self.assertTrue(d["comparable"])
+        self.assertEqual((d["from_revision"], d["to_revision"]), (3, 4))
+        self.assertEqual(d["sealed_before"], 1.0)
+        # 变化点：新增 1.5 + 后缀重算 2.0/3.0，全部落在封存边界之后
+        self.assertEqual(d["changed_count"], 3)
+        self.assertEqual(d["first_changed_timestamp"], 1.5)
+        self.assertEqual(d["last_changed_timestamp"], 3.0)
+        kinds = {c["timestamp"]: c["kind"] for c in d["changes"]}
+        self.assertEqual(kinds, {1.5: "added", 2.0: "modified", 3.0: "modified"})
+        self.assertTrue(d["suffix_only"])
+        # 封存前缀逐点一致核验：坐标与协方差对角完全相同
+        self.assertTrue(d["sealed_prefix"]["identical"])
+        self.assertEqual(d["sealed_prefix"]["checked_points"], 1)
+        # 显式逐位核对封存点（t=1.0）与后缀点（t=2.0 确实变化）
+        s3 = {p["timestamp"]: p for p in self.store.revision_snapshot(3)["points"]}
+        s4 = {p["timestamp"]: p for p in self.store.revision_snapshot(4)["points"]}
+        self.assertEqual(s3[1.0]["state"], s4[1.0]["state"])
+        self.assertEqual(s3[1.0]["P_diag"], s4[1.0]["P_diag"])
+        self.assertNotEqual(s3[2.0]["state"], s4[2.0]["state"])
+
+    def test_diff_first_revision_clear_reason(self):
+        self.submit("A", 1.0, 1.0, 0.0)
+        d = self.store.diff_revision(1)
+        self.assertFalse(d["comparable"])
+        self.assertIn("首个", d["reason"])
+        self.assertIn("不以当前轨迹替代", d["reason"])
+
+    def test_diff_unknown_revision_returns_none(self):
+        self.submit("A", 1.0, 1.0, 0.0)
+        self.assertIsNone(self.store.diff_revision(99))
+
+    def test_missing_adjacent_snapshot_clear_reason(self):
+        # 模拟只保留了部分快照的持久化文件（如升级前数据）：修订 2 在、修订 1 缺
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        try:
+            s1 = Store(path=path, config=cfg())
+            s1.submit_observation({"id": "A", "timestamp": 1.0, "x": 1.0, "y": 0.0})
+            s1.submit_observation({"id": "B", "timestamp": 2.0, "x": 2.0, "y": 0.0})
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            data["snapshots"] = data["snapshots"][1:]  # 丢弃修订 1 的快照
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            s2 = Store(path=path)
+            d = s2.diff_revision(2)
+            self.assertFalse(d["comparable"])
+            self.assertIn("相邻快照缺失", d["reason"])
+            self.assertIn("不以当前轨迹替代", d["reason"])
+        finally:
+            os.unlink(path)
+
+    def test_legacy_state_without_snapshots(self):
+        # 旧版本状态文件没有 snapshots 字段：正常加载，差异查询返回“无快照”
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        try:
+            s1 = Store(path=path, config=cfg())
+            s1.submit_observation({"id": "A", "timestamp": 1.0, "x": 1.0, "y": 0.0})
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            data.pop("snapshots", None)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            s2 = Store(path=path)
+            self.assertEqual(s2.revision_catalog(), [])
+            self.assertIsNone(s2.diff_revision(1))
+            # 既有日志与轨迹仍原样恢复
+            self.assertEqual(s2.state()["revision"], 1)
+        finally:
+            os.unlink(path)
+
+    def test_reopen_preserves_snapshots_and_diff(self):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        try:
+            s1 = Store(path=path, config=cfg(lag=2.0))
+            for oid, t in (("A", 1.0), ("B", 2.0), ("C", 3.0)):
+                s1.submit_observation({"id": oid, "timestamp": t, "x": t, "y": 0.0})
+            s1.submit_observation({"id": "LATE", "timestamp": 1.5, "x": 1.2, "y": 0.5})
+            before = s1.diff_revision(4)
+            # “关闭并重新打开”：同一对修订得到相同差异凭证
+            s2 = Store(path=path)
+            self.assertEqual(s2.diff_revision(4), before)
+            self.assertEqual(s2.revision_catalog(), s1.revision_catalog())
+            self.assertEqual(s2.revision_snapshot(4), s1.revision_snapshot(4))
+        finally:
+            os.unlink(path)
+
+    def test_reset_clears_snapshots(self):
+        self.submit("A", 1.0, 1.0, 0.0)
+        self.store.reset()
+        self.assertEqual(self.store.revision_catalog(), [])
+        self.assertIsNone(self.store.diff_revision(1))
 
 
 class TestStaleResultSuppression(unittest.TestCase):

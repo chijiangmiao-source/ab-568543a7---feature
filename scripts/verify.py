@@ -90,6 +90,7 @@ def run_build_checks() -> bool:
             "/static/app.js" in html
             and "api/observations" in js
             and "api/state" in js
+            and "api/revisions/diff" in js
             and all(decision in bundle for decision in ("ACCEPTED", "REPLAYED", "REJECTED"))
         )
     ok = check("页面资产存在且引用业务 API 与三类结论", assets_ok) and ok
@@ -248,6 +249,49 @@ def smoke(base: str) -> bool:
     # 同标识内容不同拒绝
     _, conflict = obs("VRF-A", 1.0, 1.0, 0.9)
     ok = check("同标识内容不同拒绝", conflict.get("decision") == "REJECTED") and ok
+
+    # 修订快照目录：每次接受保留只读快照（末观测时刻 + 封存边界）
+    _, state_rev = http_json("GET", base + "/api/state")
+    revs = state_rev.get("revisions", [])
+    ok = check(
+        "每次接受保留只读快照（目录含修订 1..4、末观测时刻与封存边界）",
+        [m.get("revision") for m in revs] == [1, 2, 3, 4]
+        and revs[-1].get("last_observation_time") == 3.0
+        and revs[-1].get("sealed_before") == 1.0,
+        json.dumps(revs, ensure_ascii=False)[:200],
+    ) and ok
+
+    # 修订 4 相对紧邻上一修订（3）的差异凭证
+    status, diff4 = http_json("GET", base + "/api/revisions/diff?revision=4")
+    ok = check(
+        "迟到观测差异凭证：仅滞后窗口后缀变化且封存前缀逐点一致",
+        status == 200
+        and diff4.get("comparable") is True
+        and diff4.get("from_revision") == 3
+        and diff4.get("to_revision") == 4
+        and diff4.get("changed_count") == 3
+        and diff4.get("first_changed_timestamp") == 1.5
+        and diff4.get("last_changed_timestamp") == 3.0
+        and diff4.get("sealed_prefix", {}).get("identical") is True
+        and diff4.get("suffix_only") is True,
+        json.dumps(diff4, ensure_ascii=False)[:200],
+    ) and ok
+
+    # 首个修订：明确原因，不以当前轨迹替代
+    status, diff1 = http_json("GET", base + "/api/revisions/diff?revision=1")
+    ok = check(
+        "首个修订给出明确原因且不以当前轨迹替代",
+        status == 200
+        and diff1.get("comparable") is False
+        and "首个" in diff1.get("reason", ""),
+    ) and ok
+
+    # 无快照修订：404 与明确原因
+    status, diff_missing = http_json("GET", base + "/api/revisions/diff?revision=999")
+    ok = check(
+        "无快照修订返回 404 与明确原因",
+        status == 404 and "error" in diff_missing,
+    ) and ok
 
     # 非法 JSON
     req = urllib.request.Request(

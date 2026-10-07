@@ -5,7 +5,11 @@
 GET  /healthz              健康响应（不依赖业务状态，永远 200）
 GET  /                     复核页面
 GET  /static/app.js        页面脚本
-GET  /api/state            当前配置 / 日志 / 轨迹 / 修订号
+GET  /api/state            当前配置 / 日志 / 轨迹 / 修订号 / 修订快照目录
+GET  /api/revisions/diff?revision=N
+                           所选修订相对紧邻上一修订的差异凭证（前后修订号、
+                           首末变化时刻、变化点数量、封存边界之前逐点一致核验）；
+                           首个修订或相邻快照缺失时给出明确原因，不以当前轨迹替代
 POST /api/config           建立二维位置与速度初值、噪声与滞后长度
 POST /api/observations     按接收顺序录入一条观测
 POST /api/reset            清空日志与轨迹（重新建档）
@@ -20,7 +24,7 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .kf import KalmanError
 from .store import Store, StoreError
@@ -71,6 +75,37 @@ def make_handler(store: Store):
                 return
             if route == "/api/state":
                 _json_response(self, 200, store.state())
+                return
+            if route == "/api/revisions/diff":
+                params = parse_qs(urlparse(self.path).query)
+                raw = params.get("revision", [""])[0]
+                try:
+                    revision = int(raw)
+                except (TypeError, ValueError):
+                    _json_response(
+                        self,
+                        400,
+                        {"error": "缺少或非法的 revision 参数", "kind": "bad_request"},
+                    )
+                    return
+                result = store.diff_revision(revision)
+                if result is None:
+                    _json_response(
+                        self,
+                        404,
+                        {
+                            "error": (
+                                f"修订 {revision} 没有已保留的发布快照"
+                                "（仅成功接受才保留快照，重放/拒绝不产生）"
+                            ),
+                            "kind": "revision_not_found",
+                            "available_revisions": [
+                                m["revision"] for m in store.revision_catalog()
+                            ],
+                        },
+                    )
+                    return
+                _json_response(self, 200, result)
                 return
             if route == "/" or route == "/index.html":
                 _static_response(

@@ -3,6 +3,10 @@
  * 旧结果抑制（客户端侧）：每次请求带单调 requestId；响应只在其
  * requestId 为已完成的最大序号、且服务端修订号/日志长度不小于当前展示时
  * 才允许刷新页面，确保迟到的旧修订结果永不覆盖最新页面。
+ *
+ * 修订差异复核：每次接受发布的只读快照持久化在服务端；选择任一修订后
+ * 查询其相对紧邻上一修订的差异凭证（首末变化时刻、变化点数量、封存边界
+ * 之前逐点一致核验）。差异查询的是不可变历史快照，不参与旧结果抑制。
  */
 "use strict";
 
@@ -141,7 +145,77 @@ function render(s) {
       )
       .join("");
   }
+
+  // 修订快照目录（供差异复核选择；保留已选项）
+  updateRevisionOptions(s.revisions);
   return true;
+}
+
+/* ---------- 修订差异复核 ---------- */
+function updateRevisionOptions(revisions) {
+  const sel = $("revSelect");
+  const prev = sel.value;
+  sel.innerHTML = "";
+  if (!revisions || !revisions.length) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "（尚无已发布修订）";
+    sel.appendChild(opt);
+    return;
+  }
+  revisions
+    .slice()
+    .reverse()
+    .forEach((m) => {
+      const opt = document.createElement("option");
+      opt.value = String(m.revision);
+      const boundary =
+        m.sealed_before === null || m.sealed_before === undefined
+          ? "无封存边界"
+          : `封存边界 t≤${fmt(m.sealed_before, 3)}`;
+      opt.textContent = `修订 ${m.revision} · 末观测 t=${fmt(m.last_observation_time, 3)} · ${boundary}`;
+      sel.appendChild(opt);
+    });
+  if ([...sel.options].some((o) => o.value === prev)) sel.value = prev;
+}
+
+function kindLabel(kind) {
+  return kind === "added" ? "新增观测点" : kind === "modified" ? "后缀重算变化" : "移除";
+}
+
+function renderDiffResult(status, d) {
+  const kv = $("diffResult");
+  const body = $("diffBody");
+  if (status === 404) {
+    setMsg($("diffMsg"), "err", d.error || "所选修订没有已保留的发布快照。");
+    kv.innerHTML = "";
+    body.innerHTML = "";
+    return;
+  }
+  if (!d.comparable) {
+    // 首个修订 / 相邻快照缺失：明确原因，不以当前轨迹替代
+    setMsg($("diffMsg"), "info", `不可比较：${d.reason || "未说明"}`);
+    kv.innerHTML =
+      `<dt>前一修订</dt><dd>${d.from_revision}（快照缺失）</dd>` +
+      `<dt>所选修订</dt><dd>${d.to_revision}</dd>`;
+    body.innerHTML = "";
+    return;
+  }
+  const okAll = d.sealed_prefix.identical && d.suffix_only;
+  setMsg($("diffMsg"), okAll ? "ok" : "err", d.sealed_prefix.conclusion);
+  kv.innerHTML =
+    `<dt>修订对</dt><dd>${d.from_revision} → ${d.to_revision}</dd>` +
+    `<dt>首次变化时刻</dt><dd>${fmt(d.first_changed_timestamp, 3)}</dd>` +
+    `<dt>末次变化时刻</dt><dd>${fmt(d.last_changed_timestamp, 3)}</dd>` +
+    `<dt>变化点数量</dt><dd>${d.changed_count}</dd>` +
+    `<dt>封存边界</dt><dd>${d.sealed_before === null ? "无（本次发布无检查点）" : "t ≤ " + fmt(d.sealed_before, 3)}</dd>` +
+    `<dt>封存前缀核验</dt><dd>${d.sealed_prefix.conclusion}（核验 ${d.sealed_prefix.checked_points} 点）</dd>`;
+  body.innerHTML = d.changes
+    .map(
+      (c) =>
+        `<tr><td>${c.seq}</td><td>${fmt(c.timestamp, 3)}</td><td>${kindLabel(c.kind)}</td></tr>`
+    )
+    .join("");
 }
 
 async function refresh(allowStaleNote) {
@@ -206,6 +280,22 @@ $("btnObs").addEventListener("click", async () => {
   $("lastDecision").innerHTML = data.decision
     ? `<span class="badge ${data.decision}">${data.decision}</span> <span class="muted">${data.reason || data.error || ""}</span>`
     : "—";
+});
+
+$("btnDiff").addEventListener("click", async () => {
+  const rev = $("revSelect").value;
+  if (!rev) {
+    setMsg($("diffMsg"), "err", "尚无已发布修订可选择。");
+    return;
+  }
+  const res = await fetch(`/api/revisions/diff?revision=${encodeURIComponent(rev)}`);
+  let data = {};
+  try {
+    data = await res.json();
+  } catch (e) {
+    data = {};
+  }
+  renderDiffResult(res.status, data);
 });
 
 buildP0Grid();
