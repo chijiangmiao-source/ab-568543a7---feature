@@ -141,6 +141,19 @@ function render(s) {
       )
       .join("");
   }
+
+  // 可核对修订下拉框（保留当前选择；默认选中最新修订）
+  const sel = $("diffRev");
+  const revisions = s.snapshot_revisions || [];
+  const prevSel = sel.value;
+  sel.innerHTML = revisions.length
+    ? revisions
+        .slice()
+        .reverse()
+        .map((r) => `<option value="${r}">修订 ${r}</option>`)
+        .join("")
+    : '<option value="">（尚无已发布修订）</option>';
+  if (revisions.map(String).includes(prevSel)) sel.value = prevSel;
   return true;
 }
 
@@ -206,6 +219,65 @@ $("btnObs").addEventListener("click", async () => {
   $("lastDecision").innerHTML = data.decision
     ? `<span class="badge ${data.decision}">${data.decision}</span> <span class="muted">${data.reason || data.error || ""}</span>`
     : "—";
+});
+
+/* ---------- 修订差异核对 ---------- */
+function renderDiffEmpty() {
+  $("diffResult").innerHTML =
+    "<dt>前后修订号</dt><dd>—</dd>" +
+    "<dt>末观测时刻</dt><dd>—</dd>" +
+    "<dt>封存边界</dt><dd>—</dd>" +
+    "<dt>首次变化时刻</dt><dd>—</dd>" +
+    "<dt>末次变化时刻</dt><dd>—</dd>" +
+    "<dt>变化点数量</dt><dd>—</dd>" +
+    "<dt>封存前缀核验</dt><dd>—</dd>";
+  $("diffBody").innerHTML = '<tr><td colspan="4" class="muted">尚未查询</td></tr>';
+}
+
+$("btnDiff").addEventListener("click", async () => {
+  const rev = parseInt($("diffRev").value, 10);
+  if (!Number.isInteger(rev)) {
+    setMsg($("diffMsg"), "err", "请先选择已成功发布的修订。");
+    renderDiffEmpty();
+    return;
+  }
+  const res = await fetch(`/api/diff?revision=${encodeURIComponent(rev)}`);
+  const d = await res.json();
+  if (!d.ok) {
+    // 快照缺失 / 首个修订 / 未知修订：明确原因，绝不以当前轨迹替代
+    setMsg($("diffMsg"), "err", `无法核对：${d.reason || d.error || "未知原因"}`);
+    renderDiffEmpty();
+    return;
+  }
+  const pc = d.prefix_check || {};
+  const verdict = d.verified ? "ok" : "err";
+  setMsg(
+    $("diffMsg"),
+    verdict,
+    `差异凭证：修订 ${d.prev_revision} → ${d.revision}，变化 ${d.changed_count} 点；` +
+      (d.verified ? "封存前缀核验通过，差异全部落在滞后窗口允许的后缀。" : "封存前缀核验未通过，请检查！"),
+  );
+  $("diffResult").innerHTML =
+    `<dt>前后修订号</dt><dd>${d.prev_revision} → ${d.revision}</dd>` +
+    `<dt>末观测时刻</dt><dd>${fmt(d.last_timestamp, 3)}</dd>` +
+    `<dt>封存边界</dt><dd>${d.sealed_boundary === null ? "（无）" : "t ≤ " + fmt(d.sealed_boundary, 3)}</dd>` +
+    `<dt>首次变化时刻</dt><dd>${fmt(d.first_changed_timestamp, 3)}</dd>` +
+    `<dt>末次变化时刻</dt><dd>${fmt(d.last_changed_timestamp, 3)}</dd>` +
+    `<dt>变化点数量</dt><dd>${d.changed_count}</dd>` +
+    `<dt>封存前缀核验</dt><dd>${pc.conclusion || "—"}</dd>`;
+  const kindName = { added: "新增（迟到观测）", modified: "修正（后缀重算）" };
+  $("diffBody").innerHTML = d.changes.length
+    ? d.changes
+        .map((c) => {
+          const pos =
+            c.kind === "modified"
+              ? `${fmtArr(c.before.state.slice(0, 2))} → ${fmtArr(c.after.state.slice(0, 2))}`
+              : `— → ${fmtArr(c.after.state.slice(0, 2))}`;
+          return `<tr><td>${c.seq}</td><td>${fmt(c.timestamp, 3)}</td>` +
+            `<td>${kindName[c.kind] || c.kind}</td><td>${pos}</td></tr>`;
+        })
+        .join("")
+    : '<tr><td colspan="4" class="muted">两修订轨迹逐点一致，无变化</td></tr>';
 });
 
 buildP0Grid();

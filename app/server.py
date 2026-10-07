@@ -5,7 +5,8 @@
 GET  /healthz              健康响应（不依赖业务状态，永远 200）
 GET  /                     复核页面
 GET  /static/app.js        页面脚本
-GET  /api/state            当前配置 / 日志 / 轨迹 / 修订号
+GET  /api/state            当前配置 / 日志 / 轨迹 / 修订号 / 可核对修订列表
+GET  /api/diff?revision=N  修订 N 相对紧邻上一修订的差异凭证（只读快照核对）
 POST /api/config           建立二维位置与速度初值、噪声与滞后长度
 POST /api/observations     按接收顺序录入一条观测
 POST /api/reset            清空日志与轨迹（重新建档）
@@ -20,7 +21,7 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .kf import KalmanError
 from .store import Store, StoreError
@@ -71,6 +72,20 @@ def make_handler(store: Store):
                 return
             if route == "/api/state":
                 _json_response(self, 200, store.state())
+                return
+            if route == "/api/diff":
+                query = parse_qs(urlparse(self.path).query)
+                raw = query.get("revision", [None])[0]
+                try:
+                    revision = int(raw)  # type: ignore[arg-type]
+                except (TypeError, ValueError):
+                    _json_response(
+                        self,
+                        400,
+                        {"ok": False, "error": "缺少或非法的 revision 参数（应为正整数）"},
+                    )
+                    return
+                _json_response(self, 200, store.diff_revision(revision))
                 return
             if route == "/" or route == "/index.html":
                 _static_response(

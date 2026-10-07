@@ -90,6 +90,7 @@ def run_build_checks() -> bool:
             "/static/app.js" in html
             and "api/observations" in js
             and "api/state" in js
+            and "api/diff" in js
             and all(decision in bundle for decision in ("ACCEPTED", "REPLAYED", "REJECTED"))
         )
     ok = check("页面资产存在且引用业务 API 与三类结论", assets_ok) and ok
@@ -223,6 +224,35 @@ def smoke(base: str) -> bool:
     ) and ok
     ok = check("自检查点重算后缀：anchor_seq 指向封存位置", state.get("anchor_seq") == 0) and ok
 
+    # 修订差异凭证：rev4 相对紧邻的 rev3，仅滞后窗口允许的后缀发生变化
+    status, diff4 = http_json("GET", base + "/api/diff?revision=4")
+    ok = check(
+        "修订差异 rev3→rev4：变化 3 点、首末变化 1.5/3.0、封存前缀逐点一致",
+        status == 200
+        and diff4.get("ok") is True
+        and diff4.get("prev_revision") == 3
+        and diff4.get("changed_count") == 3
+        and diff4.get("first_changed_timestamp") == 1.5
+        and diff4.get("last_changed_timestamp") == 3.0
+        and diff4.get("sealed_boundary") == 1.0
+        and diff4.get("prefix_check", {}).get("identical") is True
+        and diff4.get("suffix_only") is True
+        and diff4.get("verified") is True,
+        json.dumps(diff4, ensure_ascii=False)[:300],
+    ) and ok
+    status, diff1 = http_json("GET", base + "/api/diff?revision=1")
+    ok = check(
+        "首个修订给出明确原因且不以当前轨迹替代",
+        status == 200 and diff1.get("ok") is False and "首个" in diff1.get("reason", ""),
+    ) and ok
+    _, diff_missing = http_json("GET", base + "/api/diff?revision=99")
+    ok = check(
+        "未发布修订给出明确原因",
+        diff_missing.get("ok") is False and "尚未发布" in diff_missing.get("reason", ""),
+    ) and ok
+    status_bad, _ = http_json("GET", base + "/api/diff")
+    ok = check("缺少 revision 参数返回 400", status_bad == 400) and ok
+
     # 窗口外拒绝且轨迹不变
     _, old = obs("VRF-OLD", 0.2, 9.0, 9.0)
     _, state_after = http_json("GET", base + "/api/state")
@@ -269,6 +299,16 @@ def smoke(base: str) -> bool:
         and decisions.count("REJECTED") >= 3
         and final_state["revision"] == 4,
         str(decisions),
+    ) and ok
+    ok = check(
+        "重放/拒绝不伪造新快照：快照修订仍为 [1,2,3,4]",
+        final_state.get("snapshot_revisions") == [1, 2, 3, 4],
+        str(final_state.get("snapshot_revisions")),
+    ) and ok
+    _, diff4_again = http_json("GET", base + "/api/diff?revision=4")
+    ok = check(
+        "拒绝/回放后同一对修订的差异凭证保持不变",
+        diff4_again == diff4,
     ) and ok
     return ok
 

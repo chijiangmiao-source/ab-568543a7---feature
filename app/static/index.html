@@ -20,9 +20,9 @@
   section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
   section h2 { font-size:15px; margin:0 0 12px; color:var(--info); }
   label { display:block; font-size:12px; color:var(--muted); margin:8px 0 3px; }
-  input { width:100%; padding:6px 8px; background:#0b1220; color:var(--fg);
+  input, select { width:100%; padding:6px 8px; background:#0b1220; color:var(--fg);
           border:1px solid var(--line); border-radius:6px; font-size:13px; }
-  input:focus { outline:none; border-color:var(--accent); }
+  input:focus, select:focus { outline:none; border-color:var(--accent); }
   .row { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; }
   .row4 { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; }
   .p0 { display:grid; grid-template-columns:repeat(4,1fr); gap:6px; }
@@ -119,6 +119,35 @@
       </dl>
       <div class="muted" style="margin-top:8px">
         旧计算结果不会覆盖本区域：页面始终展示服务器最新修订；若在途结果过期将显示“已被抑制”。
+      </div>
+    </section>
+
+    <section>
+      <h2>④ 修订差异核对（相对紧邻上一修订）</h2>
+      <label>选择已成功发布的修订（每次接受的只读快照）</label>
+      <select id="diffRev"></select>
+      <button id="btnDiff">查询相邻差异</button>
+      <div class="msg" id="diffMsg"></div>
+      <dl class="kv" id="diffResult" style="margin-top:10px">
+        <dt>前后修订号</dt><dd>—</dd>
+        <dt>末观测时刻</dt><dd>—</dd>
+        <dt>封存边界</dt><dd>—</dd>
+        <dt>首次变化时刻</dt><dd>—</dd>
+        <dt>末次变化时刻</dt><dd>—</dd>
+        <dt>变化点数量</dt><dd>—</dd>
+        <dt>封存前缀核验</dt><dd>—</dd>
+      </dl>
+      <div class="tablewrap" style="max-height:200px;margin-top:10px">
+        <table>
+          <thead><tr>
+            <th>seq</th><th>轨迹时刻</th><th>变化类型</th><th>位置变化 (px, py)</th>
+          </tr></thead>
+          <tbody id="diffBody"><tr><td colspan="4" class="muted">尚未查询</td></tr></tbody>
+        </table>
+      </div>
+      <div class="muted" style="margin-top:8px">
+        差异凭证来自持久化的修订快照：重放/拒绝不产生快照；快照缺失或为首个修订时给出明确原因，
+        绝不以当前轨迹替代。关闭并重开页面后查询同一对修订结果一致。
       </div>
     </section>
   </div>

@@ -8,9 +8,15 @@
 * 检查点之前的**已封存位置逐位不变**，绝不改写；
 * 窗口外观测、同刻非递增顺序、同标识内容冲突等一律拒绝，不改变已发布轨迹；
 * 观测日志**只追加、不可变**，修订号**单调递增**；
+* 每次接受推进修订号时，与日志追加在**同一次持久化裁决**中保留该次发布轨迹的
+  **只读快照**（末观测时刻 + 封存边界 + 全部轨迹点）；重放/拒绝/同内容回放
+  **不产生**新快照；据此可核对任一修订相对**紧邻上一修订**的差异凭证
+  （前后修订号、首次/末次变化时刻、变化点数量、封存边界之前逐点一致核验），
+  快照缺失或为首个修订时给出明确原因，**绝不以当前轨迹替代**；
 * 计算期间可继续录入；旧计算结果带代际令牌，提交时 CAS，过期结果一律丢弃，
   **不得覆盖最新页面**；
-* 状态原子持久化（tmp + `os.replace`），**重开后恢复相同日志与轨迹**。
+* 状态原子持久化（tmp + `os.replace`），**重开后恢复相同日志与轨迹**，
+  同一对修订的差异凭证重开后保持一致。
 
 零第三方运行时依赖：服务端仅用 Python 3.11 标准库（自带极简稠密线性代数），
 前端为原生 HTML/JS，无需构建。
@@ -21,10 +27,12 @@
 app/
   linalg.py        纯 Python 矩阵运算 / Cholesky 正定校验 / 2x2 求逆
   kf.py            二维 CV 卡尔曼滤波 + 检查点/后缀重放（FixedLagSmoother）
-  store.py         不可变日志、单调修订号、窗口规则、CAS 旧结果抑制、持久化
+  store.py         不可变日志、单调修订号、修订只读快照与相邻差异核对、
+                   窗口规则、CAS 旧结果抑制、持久化
   server.py        HTTP 服务（健康检查 / 页面 / 业务 API），端口可配置
-  static/          复核页面（逐条展示接受/重放/拒绝、当前位置、协方差对角、残差）
-tests/test_core.py 代码测试（20 个）
+  static/          复核页面（逐条展示接受/重放/拒绝、当前位置、协方差对角、残差、
+                   修订差异核对）
+tests/test_core.py 代码测试（32 个）
 scripts/verify.py  可执行验收服务 verify
 Dockerfile, compose.yaml
 ```
@@ -43,7 +51,10 @@ python3 -m app.server --port 8080 --state ./data/state.json
 2. 按接收顺序录入观测（稳定标识 `id`、采样时刻 `timestamp`、二维位置 `x/y`），
    最多 32 条；
 3. 逐条查看 **ACCEPTED / REPLAYED / REJECTED** 结论、当前位置、
-   协方差对角与创新残差，以及已发布轨迹与不可变日志。
+   协方差对角与创新残差，以及已发布轨迹与不可变日志；
+4. 在“修订差异核对”中选择任一已成功发布的修订，查看其相对**紧邻上一修订**的
+   差异凭证：前后修订号、末观测时刻、封存边界、首次/末次变化时刻、变化点数量、
+   逐点明细，以及“封存边界之前逐点一致”的核验结论。
 
 ## HTTP 接口
 
@@ -51,7 +62,8 @@ python3 -m app.server --port 8080 --state ./data/state.json
 | --- | --- |
 | `GET /healthz` | 健康响应 `{"status":"ok"}` |
 | `GET /`、`GET /static/app.js` | 可交付页面 |
-| `GET /api/state` | 配置、修订号、检查点、日志、轨迹、当前位置 |
+| `GET /api/state` | 配置、修订号、检查点、日志、轨迹、当前位置、可核对修订列表 |
+| `GET /api/diff?revision=N` | 修订 N 相对紧邻上一修订的差异凭证（只读快照核对；首个修订/快照缺失返回明确原因，不以当前轨迹替代） |
 | `POST /api/config` | 建立初值/噪声/滞后；非法矩阵返回 422 并说明原因 |
 | `POST /api/observations` | 录入一条观测，返回逐条结论 |
 | `POST /api/reset` | 清空日志与轨迹 |
@@ -100,6 +112,7 @@ docker compose up              # 同时启动；verify 等 web 健康后执行�
 | 同标识同内容回放原结论 / 内容不同拒绝 | `Store._quick_decide_locked` 同标识分支 |
 | 窗口外观测、同刻非递增拒绝 | 同文件窗口与同刻分支 |
 | 不可变日志 / 单调修订号 | `Store` 中 `_log` 只追加；仅接受成功时 `_revision += 1` |
+| 修订只读快照 / 相邻差异核对 | 接受提交时 `Store._build_snapshot_locked` 与日志同一次持久化；`Store.diff_revision` 仅读快照比较相邻修订，核验封存前缀逐点一致、差异仅落在窗口后缀 |
 | 计算中继续录入、旧结果不覆盖最新页面 | 锁内校验 → **锁外重放** → 锁内 CAS（代际 + next_seq），失败重试；前端再按修订/日志长度抑制 |
-| 重开恢复相同日志与轨迹 | 原子写 JSON；启动时 `_load`，测试 `test_reopen_restores_log_and_track` |
+| 重开恢复相同日志与轨迹 | 原子写 JSON；启动时 `_load`，测试 `test_reopen_restores_log_and_track`、`test_reopen_restores_snapshots_and_same_diff` |
 | 非法噪声 / 奇异创新 | `FilterConfig.validate`（Cholesky）、`_kf_step`（S 求逆+特征值），失败保留最近轨迹 |

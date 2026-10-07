@@ -7,6 +7,9 @@
 * 单调修订号：仅当一次纳入成功发布新轨迹时修订号 +1；任何拒绝/重放都不改变它。
 * 固定滞后窗口规则：迟到观测只有落在 ``最新采样时刻 - lag`` 之内才会被接受，
   窗口外、同标识内容冲突、顺序违规等一律拒绝且保持已发布轨迹不变。
+* 修订快照：每次接受推进修订号时，与日志追加同一次持久化裁决中保留该次发布
+  轨迹的只读快照（含末观测时刻与封存边界）；重放/拒绝/同内容回放不产生快照。
+  据此可核对任一修订相对紧邻上一修订的差异凭证。
 * 旧结果抑制：计算结果带“代际（generation）”令牌，提交时若已有更新的代际，
   旧结果一律丢弃，绝不覆盖最新页面。
 * 持久化：每次提交原子写入 JSON 文件（tmp + os.replace）；重开后原样恢复。
@@ -72,6 +75,9 @@ class Store:
         self._next_seq = 0
         self._revision = 0
         self._track: Optional[Track] = None
+        # 修订号 -> 该次发布轨迹的只读快照（末观测时刻 + 封存边界 + 全部轨迹点）。
+        # 仅在接受推进修订号时写入；重放/拒绝/同内容回放绝不伪造新快照。
+        self._snapshots: Dict[int, Dict[str, Any]] = {}
         self._generation = 0  # 计算代际；每次发起纳入 +1，用于旧结果抑制
         # 测试钩子：重放前调用（例如注入延迟以制造并发交错）
         self.before_replay_hook = None
@@ -95,6 +101,7 @@ class Store:
             self._smoother = FixedLagSmoother(config)
             self._revision = 0
             self._track = None
+            self._snapshots = {}
             self._persist_locked()
             return self.state_locked()
 
@@ -105,6 +112,7 @@ class Store:
             self._next_seq = 0
             self._revision = 0
             self._track = None
+            self._snapshots = {}
             self._generation += 1
             self._persist_locked()
             return self.state_locked()
@@ -180,6 +188,8 @@ class Store:
                 assert result is not None
                 self._track = self._build_track(result, new_obs)
                 self._revision = base_revision + 1
+                # 与日志追加同一次持久化裁决：保留本次发布轨迹的只读快照
+                self._snapshots[self._revision] = self._build_snapshot_locked()
                 point = next(p for p in self._track.points if p["seq"] == new_obs.seq)
                 entry = {
                     **new_obs.to_dict(),
@@ -309,6 +319,171 @@ class Store:
         return Track(revision=result.revision, anchor_seq=result.anchor_seq, points=points)
 
     # ------------------------------------------------------------------ #
+    # 修订快照与相邻差异核对
+    # ------------------------------------------------------------------ #
+
+    def _build_snapshot_locked(self) -> Dict[str, Any]:
+        """把当前已发布轨迹冻结为只读快照（深拷贝，此后绝不改写）。
+
+        快照记录：修订号、检查点、末观测时刻、封存边界（``末观测时刻 - lag``，
+        lag 为 0 时无封存边界）以及全部轨迹点（坐标/速度/协方差对角/残差）。
+        """
+        assert self._track is not None and self._config is not None
+        points = [
+            {
+                "seq": int(p["seq"]),
+                "timestamp": float(p["timestamp"]),
+                "state": [float(v) for v in p["state"]],
+                "P_diag": [float(v) for v in p["P_diag"]],
+                "residual": [float(v) for v in p["residual"]],
+            }
+            for p in self._track.points
+        ]
+        last_ts = points[-1]["timestamp"] if points else None
+        boundary = None
+        if last_ts is not None and self._config.lag > 0.0:
+            boundary = last_ts - self._config.lag
+        return {
+            "revision": self._track.revision,
+            "anchor_seq": self._track.anchor_seq,
+            "last_timestamp": last_ts,
+            "sealed_boundary": boundary,
+            "points": points,
+        }
+
+    def diff_revision(self, revision: int) -> Dict[str, Any]:
+        """核对 ``revision`` 相对其紧邻上一修订（revision-1）的差异凭证。
+
+        仅读取持久化的修订快照，绝不以当前轨迹替代：
+        * 所选修订无快照 / 紧邻上一修订快照缺失 / 所选为首个修订时，
+          返回 ``ok=False`` 与明确原因；
+        * 否则返回前后修订号、首次/末次变化时刻、变化点数量与逐点明细，
+          以及“封存边界之前逐点一致”的核验结论。
+        """
+        with self._lock:
+            if revision < 1:
+                return {"ok": False, "revision": revision, "reason": "修订号必须为正整数"}
+            snap = self._snapshots.get(revision)
+            if snap is None:
+                if revision > self._revision:
+                    reason = (
+                        f"修订 {revision} 尚未发布（当前最新修订为 {self._revision}），"
+                        "无快照可核对"
+                    )
+                else:
+                    reason = (
+                        f"修订 {revision} 的发布快照缺失（可能源自旧版状态文件），"
+                        "无法核对，且不以当前轨迹替代"
+                    )
+                return {"ok": False, "revision": revision, "reason": reason}
+            prev = self._snapshots.get(revision - 1)
+            if prev is None:
+                if revision == 1:
+                    reason = "修订 1 为首个发布修订，无紧邻的上一修订可比较"
+                else:
+                    reason = (
+                        f"紧邻上一修订 {revision - 1} 的发布快照缺失，"
+                        "无法核对相邻差异，且不以当前轨迹替代"
+                    )
+                return {"ok": False, "revision": revision, "reason": reason}
+            return self._diff_snapshots(prev, snap)
+
+    @staticmethod
+    def _diff_snapshots(
+        prev: Dict[str, Any], snap: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """比较两个相邻修订快照，产出差异凭证与封存前缀核验结论。"""
+        old_by_seq = {p["seq"]: p for p in prev["points"]}
+        new_by_seq = {p["seq"]: p for p in snap["points"]}
+
+        changes: List[Dict[str, Any]] = []
+        for seq, pn in new_by_seq.items():
+            po = old_by_seq.get(seq)
+            if po is None:
+                changes.append(
+                    {
+                        "seq": seq,
+                        "timestamp": pn["timestamp"],
+                        "kind": "added",
+                        "after": {"state": list(pn["state"]), "P_diag": list(pn["P_diag"])},
+                    }
+                )
+            elif pn["state"] != po["state"] or pn["P_diag"] != po["P_diag"]:
+                changes.append(
+                    {
+                        "seq": seq,
+                        "timestamp": pn["timestamp"],
+                        "kind": "modified",
+                        "before": {"state": list(po["state"]), "P_diag": list(po["P_diag"])},
+                        "after": {"state": list(pn["state"]), "P_diag": list(pn["P_diag"])},
+                    }
+                )
+        removed = [seq for seq in old_by_seq if seq not in new_by_seq]
+        changes.sort(key=lambda c: (c["timestamp"], c["seq"]))
+
+        boundary = snap["sealed_boundary"]
+        # 封存前缀核验：封存边界之前（含边界）的轨迹点，坐标与协方差对角必须
+        # 与上一修订逐点完全相同；边界前新增点或点被移除同样视为破坏封存。
+        sealed_points = 0
+        prefix_identical = True
+        mismatches: List[str] = []
+        if boundary is not None:
+            for seq, pn in new_by_seq.items():
+                if pn["timestamp"] <= boundary + _EPS:
+                    sealed_points += 1
+                    po = old_by_seq.get(seq)
+                    if po is None:
+                        prefix_identical = False
+                        mismatches.append(f"seq={seq} 为封存边界之前的新增点")
+                    elif pn["state"] != po["state"] or pn["P_diag"] != po["P_diag"]:
+                        prefix_identical = False
+                        mismatches.append(f"seq={seq} 在封存边界之前被改写")
+        if removed:
+            prefix_identical = False
+            mismatches.append(f"上一修订的 {len(removed)} 个轨迹点在本修订中缺失")
+
+        # 差异只允许落在当时滞后窗口允许的后缀（封存边界之后）
+        if boundary is None:
+            suffix_only = not removed
+        else:
+            suffix_only = not removed and all(
+                c["timestamp"] > boundary + _EPS for c in changes
+            )
+
+        if boundary is None:
+            conclusion = "本修订无封存边界（lag=0，自初始先验整体重放），无封存前缀需核验"
+        elif prefix_identical:
+            conclusion = (
+                f"核验通过：封存边界之前（t≤{boundary:.6g}）的 {sealed_points} 个轨迹点"
+                "逐点一致（坐标与协方差对角完全相同）"
+            )
+        else:
+            conclusion = "核验失败：封存前缀被改写（" + "；".join(mismatches) + "）"
+
+        changed_ts = [c["timestamp"] for c in changes]
+        return {
+            "ok": True,
+            "revision": snap["revision"],
+            "prev_revision": prev["revision"],
+            "last_timestamp": snap["last_timestamp"],
+            "sealed_boundary": boundary,
+            "anchor_seq": snap["anchor_seq"],
+            "changed_count": len(changes),
+            "first_changed_timestamp": min(changed_ts) if changed_ts else None,
+            "last_changed_timestamp": max(changed_ts) if changed_ts else None,
+            "changes": changes,
+            "removed_count": len(removed),
+            "prefix_check": {
+                "sealed_boundary": boundary,
+                "sealed_points": sealed_points,
+                "identical": prefix_identical,
+                "conclusion": conclusion,
+            },
+            "suffix_only": suffix_only,
+            "verified": prefix_identical and suffix_only,
+        }
+
+    # ------------------------------------------------------------------ #
     # 结论构造
     # ------------------------------------------------------------------ #
 
@@ -434,6 +609,7 @@ class Store:
             "current": current,
             "log": list(self._log),
             "track": self._track.to_dict() if self._track else None,
+            "snapshot_revisions": sorted(self._snapshots),
         }
 
     # ------------------------------------------------------------------ #
@@ -498,6 +674,7 @@ class Store:
             "revision": self._revision,
             "log": self._log,
             "track": self._track.to_dict() if self._track else None,
+            "snapshots": {str(rev): snap for rev, snap in sorted(self._snapshots.items())},
         }
         directory = os.path.dirname(os.path.abspath(self._path))
         os.makedirs(directory, exist_ok=True)
@@ -527,3 +704,7 @@ class Store:
         self._next_seq = int(data.get("next_seq", len(self._log)))
         self._revision = int(data.get("revision", 0))
         self._track = Track.from_dict(data.get("track"))
+        # 旧版状态文件可能没有 snapshots 字段：按缺失处理（差异核对会给出明确原因）
+        self._snapshots = {
+            int(rev): snap for rev, snap in (data.get("snapshots") or {}).items()
+        }
